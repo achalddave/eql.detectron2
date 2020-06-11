@@ -5,7 +5,9 @@ import torch
 
 from detectron2.layers import ShapeSpec
 from detectron2.structures import Boxes, Instances
+from detectron2.modeling.box_regression import Box2BoxTransform
 
+from detectron2.config import configurable
 from detectron2.modeling.poolers import ROIPooler
 from detectron2.modeling.roi_heads.box_head import build_box_head
 
@@ -28,25 +30,60 @@ class EQLROIHeads(StandardROIHeads):
     To implement more models, you can subclass it and implement a different
     :meth:`forward()` or a head.
     """
-    def _init_box_head(self, cfg, input_shape):
+    @configurable
+    def __init__(
+        self,
+        *,
+        lambda_,
+        prior_prob,
+        bbox_reg_weights,
+        smooth_l1_beta,
+        freq_info,
+        test_score_thresh,
+        test_nms_thresh,
+        test_detections_per_img,
+        **kwargs
+    ):
+        self.lambda_ = lambda_
+        self.smooth_l1_beta = smooth_l1_beta
+        self.prior_prob = prior_prob
+        self.box2box_transform = Box2BoxTransform(weights=bbox_reg_weights)
+        self.freq_info = freq_info
+        self.test_score_thresh = test_score_thresh
+        self.test_nms_thresh = test_nms_thresh
+        self.test_detections_per_img = test_detections_per_img
+        super().__init__(**kwargs)
+
+    @classmethod
+    def from_config(cls, cfg, input_shape):
+        ret = super().from_config(cfg, input_shape)
+        ret["lambda_"] = cfg.MODEL.ROI_HEADS.LAMBDA
+        ret["prior_prob"] = cfg.MODEL.ROI_HEADS.PRIOR_PROB
+        return ret
+
+    @classmethod
+    def _init_box_head(cls, cfg, input_shape):
         # fmt: off
+        in_features              = cfg.MODEL.ROI_HEADS.IN_FEATURES
         pooler_resolution        = cfg.MODEL.ROI_BOX_HEAD.POOLER_RESOLUTION
-        pooler_scales            = tuple(1.0 / input_shape[k].stride for k in self.in_features)
+        pooler_scales            = tuple(1.0 / input_shape[k].stride for k in in_features)
         sampling_ratio           = cfg.MODEL.ROI_BOX_HEAD.POOLER_SAMPLING_RATIO
         pooler_type              = cfg.MODEL.ROI_BOX_HEAD.POOLER_TYPE
-        self.train_on_pred_boxes = cfg.MODEL.ROI_BOX_HEAD.TRAIN_ON_PRED_BOXES
-        self.lambda_             = cfg.MODEL.ROI_HEADS.LAMBDA
-        self.prior_prob          = cfg.MODEL.ROI_HEADS.PRIOR_PROB
+        prior_prob = cfg.MODEL.ROI_HEADS.PRIOR_PROB
+        bbox_reg_weights = cfg.MODEL.ROI_BOX_HEAD.BBOX_REG_WEIGHTS
+        smooth_l1_beta           = cfg.MODEL.ROI_BOX_HEAD.SMOOTH_L1_BETA
         # fmt: on
 
         # If StandardROIHeads is applied on multiple feature maps (as in FPN),
         # then we share the same predictors and therefore the channel counts must be the same
-        in_channels = [input_shape[f].channels for f in self.in_features]
+        in_channels = [input_shape[f].channels for f in in_features]
         # Check all channel counts are equal
         assert len(set(in_channels)) == 1, in_channels
         in_channels = in_channels[0]
+        num_classes = cfg.MODEL.ROI_HEADS.NUM_CLASSES
+        cls_agnostic_bbox_reg = cfg.MODEL.ROI_BOX_HEAD.CLS_AGNOSTIC_BBOX_REG
 
-        self.box_pooler = ROIPooler(
+        box_pooler = ROIPooler(
             output_size=pooler_resolution,
             scales=pooler_scales,
             sampling_ratio=sampling_ratio,
@@ -55,17 +92,28 @@ class EQLROIHeads(StandardROIHeads):
         # Here we split "box head" and "box predictor", which is mainly due to historical reasons.
         # They are used together so the "box predictor" layers should be part of the "box head".
         # New subclasses of ROIHeads do not need "box predictor"s.
-        self.box_head = build_box_head(
+        box_head = build_box_head(
             cfg, ShapeSpec(channels=in_channels, height=pooler_resolution, width=pooler_resolution)
         )
-
-        self.box_predictor = EQLFastRCNNOutputLayers(
-            self.box_head.output_size, self.num_classes, self.cls_agnostic_bbox_reg,
-            prior_prob=self.prior_prob
+        box_predictor = EQLFastRCNNOutputLayers(
+            box_head._output_size, num_classes, cls_agnostic_bbox_reg,
+            prior_prob=prior_prob
         )
 
         # load freq
-        self.freq_info = torch.FloatTensor(get_image_count_frequency())
+        freq_info = torch.FloatTensor(get_image_count_frequency())
+        return {
+            "box_in_features": in_features,
+            "box_pooler": box_pooler,
+            "box_head": box_head,
+            "box_predictor": box_predictor,
+            "bbox_reg_weights": bbox_reg_weights,
+            "smooth_l1_beta": smooth_l1_beta,
+            "freq_info": freq_info,
+            "test_score_thresh": cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST,
+            "test_nms_thresh": cfg.MODEL.ROI_HEADS.NMS_THRESH_TEST,
+            "test_detections_per_img": cfg.TEST.DETECTIONS_PER_IMAGE
+        }
 
     def _forward_box(
         self, features: Dict[str, torch.Tensor], proposals: List[Instances]
